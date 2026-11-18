@@ -94,9 +94,10 @@ object SshSetup {
 
     fun generateKey(type: KeyType, comment: String): GeneratedKey {
         configure()
+        if (type == KeyType.ED25519) return generateEd25519(comment)
         val jsch = JSch()
         val pair = when (type) {
-            KeyType.ED25519 -> KeyPair.genKeyPair(jsch, KeyPair.ED25519)
+            KeyType.ED25519 -> error("handled above")
             KeyType.RSA -> KeyPair.genKeyPair(jsch, KeyPair.RSA, 4096)
             KeyType.ECDSA -> KeyPair.genKeyPair(jsch, KeyPair.ECDSA, 256)
         }
@@ -109,6 +110,38 @@ object SshSetup {
         } finally {
             pair.dispose()
         }
+    }
+
+    /** Creates an Ed25519 key and writes it in the standard OpenSSH private key format. */
+    private fun generateEd25519(comment: String): GeneratedKey {
+        val priv = org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(java.security.SecureRandom())
+        val seed = priv.encoded
+        val pub = priv.generatePublicKey().encoded
+
+        fun ByteArrayOutputStream.u32(v: Int) {
+            write(v ushr 24 and 0xff); write(v ushr 16 and 0xff); write(v ushr 8 and 0xff); write(v and 0xff)
+        }
+        fun ByteArrayOutputStream.str(b: ByteArray) { u32(b.size); write(b) }
+        fun ByteArrayOutputStream.str(t: String) = str(t.toByteArray())
+
+        val blob = ByteArrayOutputStream().apply { str("ssh-ed25519"); str(pub) }.toByteArray()
+        val check = java.security.SecureRandom().nextInt()
+        val secret = ByteArrayOutputStream().apply {
+            u32(check); u32(check)
+            str("ssh-ed25519"); str(pub); str(seed + pub); str(comment)
+            var pad = 1
+            while (size() % 8 != 0) write(pad++)
+        }.toByteArray()
+        val body = ByteArrayOutputStream().apply {
+            write("openssh-key-v1".toByteArray()); write(0)
+            str("none"); str("none"); str(ByteArray(0))
+            u32(1); str(blob); str(secret)
+        }.toByteArray()
+        val b64 = java.util.Base64.getEncoder().encodeToString(body).chunked(70).joinToString("\n")
+        val pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n$b64\n-----END OPENSSH PRIVATE KEY-----\n"
+        java.util.Arrays.fill(seed, 0)
+        val publicLine = "ssh-ed25519 " + java.util.Base64.getEncoder().encodeToString(blob) + " " + comment
+        return GeneratedKey(pem.toByteArray(), publicLine, KeyType.ED25519.label)
     }
 
     /** Reads a private key. Throws IllegalArgumentException with a friendly message on problems. */
